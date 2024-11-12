@@ -1,0 +1,273 @@
+.templates_sha: &templates_sha 6a40df92957c8ce9ee741aaccc5daaaf70545b1e
+
+include:
+  - project: 'freedesktop/ci-templates'
+    ref: *templates_sha
+    file: '/templates/fedora.yml'
+
+stages:
+  - prep
+  - pre-commit
+  - test
+  - deploy
+
+.ppd.fedora:
+  variables:
+    FDO_DISTRIBUTION_VERSION: 41
+    FDO_DISTRIBUTION_TAG: '2024-09-03.1'
+    TMPDIR: $CI_BUILDS_DIR/tmpdir
+
+.ppd.fedora.build:
+  extends:
+  - .fdo.container-build@fedora
+  - .ppd.fedora
+  stage: prep
+  variables:
+    FDO_DISTRIBUTION_PACKAGES: argparse-manpage
+                               bash-completion-devel
+                               clang-analyzer
+                               e2fsprogs
+                               gcc
+                               gcovr
+                               git
+                               glib-devel
+                               glib2
+                               glibc
+                               gtk-doc
+                               libasan
+                               libgudev
+                               libgudev-devel
+                               libubsan
+                               meson
+                               polkit-devel
+                               polkit-libs
+                               pre-commit
+                               python3-coverage
+                               python3-dbusmock
+                               python3-gobject
+                               python3-gobject
+                               python3-packaging
+                               python3-pylint
+                               python3-shtab
+                               systemd
+                               systemd-devel
+                               umockdev
+                               upower
+                               upower-devel
+                               valgrind
+                               which
+    DEBUG_DEPS: glib2
+                glibc
+                libgudev
+                upower
+                polkit-libs
+    FDO_DISTRIBUTION_EXEC: |
+      mkdir -m 700 $TMPDIR -p;
+      dnf install -y --setopt=protected_packages= "dnf-command(debuginfo-install)";
+      dnf debuginfo-install -y $DEBUG_DEPS;
+
+build-fedora-container:
+  extends:
+    - .ppd.fedora.build
+  only:
+    variables:
+      - $CI_PIPELINE_SOURCE != "schedule" &&
+        $PPD_CI_ACTION != "build-image"
+
+.ppd.fedora.force-rebuild:
+  variables:
+    FDO_FORCE_REBUILD: 1
+
+build-fedora-container-schedule:
+  extends:
+    - .ppd.fedora.force-rebuild
+    - .ppd.fedora.build
+  only:
+    variables:
+      - $CI_PIPELINE_SOURCE == "schedule" && $CRON_TASK == "BUILD_CI_IMAGES"
+
+build-fedora-container-manual:
+  extends:
+    - .ppd.fedora.force-rebuild
+    - .ppd.fedora.build
+  only:
+    variables:
+      - $PPD_CI_ACTION == "build-image"
+
+.ppd.fedora.base:
+  extends:
+    - .ppd.fedora
+    - .fdo.distribution-image@fedora
+
+.ppd.fedora.test:
+  extends:
+    - .ppd.fedora.base
+  before_script:
+    - echo 8096000 > /proc/sys/fs/inotify/max_user_instances
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_PIPELINE_SOURCE == 'push'
+    - if: $CI_PIPELINE_SOURCE == 'schedule'
+    - if: $CI_PIPELINE_SOURCE == 'web'
+
+pre_commit:
+  stage: pre-commit
+  extends:
+    - .ppd.fedora.base
+  script:
+    - pre-commit run --all-files
+
+build_and_test:
+  extends:
+    - .ppd.fedora.test
+  script:
+    - meson setup
+        --werror
+        --fatal-meson-warnings
+        --warnlevel 2
+        -Dpylint=enabled
+        -Db_coverage=true
+        _build
+    - meson test -C _build --print-errorlogs
+    - .ci/fail_skipped_tests.py _build/meson-logs/testlog.junit.xml
+    - ninja -C _build coverage
+    - python_coverage_data=_build/meson-logs/python.coverage
+    - coverage3 combine --data-file=$python_coverage_data
+        _build/python-coverage/*
+    - coverage3 xml --data-file=$python_coverage_data
+        -o $python_coverage_data.xml
+    - sed "s,_build/src/,src/,g" -i $python_coverage_data.xml
+    - coverage3 report --data-file=$python_coverage_data
+    - coverage3 html --data-file=$python_coverage_data
+        -d _build/meson-logs/python-coverage-html
+    - cat _build/meson-logs/coverage.txt || true
+  artifacts:
+    when: always
+    paths:
+    - _build/meson-logs/*.txt
+    - _build/meson-logs/*.xml
+    - _build/meson-dist/*
+    - _build/meson-logs/coveragereport/*
+    - _build/meson-logs/python-coverage-html/*
+    reports:
+      junit:
+        - _build/meson-logs/testlog.junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: _build/meson-logs/*coverage.xml
+  coverage: '/^TOTAL.*\s+(\d+\%)$/'
+
+dist_install:
+  extends:
+    - .ppd.fedora.test
+  script:
+    - meson setup
+        --werror
+        --fatal-meson-warnings
+        --warnlevel 2
+        -Dmanpage=enabled
+        -Dbashcomp=enabled
+        -Dzshcomp=share/zsh/site-functions
+        -Dtests=false
+        -Dprefix=`pwd`/dist
+        _build
+    - meson install -C _build
+    - ninja -C _build uninstall -v
+    - meson dist -C _build
+  artifacts:
+    when: always
+    paths:
+    - _build/meson-logs/*.txt
+  rules:
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" ||
+           $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH)
+
+address_sanitizer:
+  extends:
+    - .ppd.fedora.test
+  script:
+    - meson setup
+        --werror
+        --buildtype=debug
+        _build
+        -Db_sanitize=address,undefined
+    - meson test -C _build --print-errorlogs -t 3
+  artifacts:
+    when: on_failure
+    paths:
+    - _build/meson-logs/*.txt
+
+valgrind:
+  extends:
+    - .ppd.fedora.test
+  script:
+    - meson setup
+        --werror
+        --buildtype=debug
+        _build
+    - meson test -C _build --print-errorlogs --setup=valgrind
+  artifacts:
+    when: on_failure
+    paths:
+    - _build/meson-logs/*.txt
+
+scan_build:
+  extends:
+    - .ppd.fedora.base
+  script:
+    - meson setup _build -Dtests=false
+    - env SCANBUILD=$(which scan-build) ninja -C _build scan-build
+  artifacts:
+    when: on_failure
+    paths:
+      - _build/meson-logs
+
+docs:
+  extends:
+    - .ppd.fedora.base
+  script:
+    - meson setup
+        -Dgtk_doc=true
+        -Dtests=false
+        _build-docs
+    - ninja -C _build-docs power-profiles-daemon-doc
+  artifacts:
+    expose_as: "HTML Documentation"
+    paths:
+    - _build-docs/docs/html
+    - _build-docs/docs/html/index.html
+    expire_in: 1 week
+  rules:
+    - if: ($CI_PIPELINE_SOURCE == "merge_request_event" ||
+           $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH)
+
+pages:
+  image: alpine:latest
+  stage: deploy
+  needs:
+    - job: build_and_test
+      artifacts: true
+    - job: docs
+      artifacts: true
+  script:
+    - mv _build-docs/docs/html public
+    - mkdir public/coverage
+    - mv _build/meson-logs/coveragereport public/coverage/daemon
+    - mv _build/meson-logs/python-coverage-html public/coverage/tool
+    - echo '
+        <html>
+          <head><title>Power Profiles Daemon Coverage</title></head>
+          <body>
+            <ul>
+              <li><a href="daemon">Daemon</a></li>
+              <li><a href="tool"><code>powerprofilesctl</code> tool</a></li>
+            </ul>
+          </body>
+        </html>' > public/coverage/index.html
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH

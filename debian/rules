@@ -1,4 +1,22 @@
 #!/usr/bin/make -f
 
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-z,defs
+
 %:
-	dh $@
+	dh $@ --with python3
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+		-Dmanpage=enabled \
+		-Dbashcomp=enabled \
+		-Dzshcomp="/usr/share/zsh/vendor-completions" \
+		$(NULL)
+
+	# Newer python3-argparse-manpage is in debian but let's wait removing this
+	# until it's there for a while, so that there's not a mismatch.
+	if dpkg --compare-versions \
+		"$$(dpkg-query --showformat='${Version}' --show python3-argparse-manpage)" lt "4.0"; then \
+		sed -i s,argparse-manpage,powerprofilesctl,g \
+			$(CURDIR)/obj-$(DEB_HOST_GNU_TYPE)/src/powerprofilesctl.1; \
+	fi
